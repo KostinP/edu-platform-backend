@@ -1,0 +1,13 @@
+env: production
+server:
+  host: "0.0.0.0"
+  port: 8080
+db:
+  user: postgres
+  password: yourpassword
+  host: localhost
+  port: 5432
+  name: edu_platform
+telegram:
+  token: "7293936081:AAFvfxEwItyB_O0x4sqmHtAUl6_Ul2Qs7qw" #codesigned_bot
+  webhook_url: "https://codesigned.ru/api/telegram/webhook"
