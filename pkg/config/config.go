@@ -11,7 +11,12 @@ type Config struct {
 	Server   ServerConfig `yaml:"server"`
 	DB       DBConfig     `yaml:"db"`
 	Telegram Telegram     `yaml:"telegram"`
+	JWT      JWTConfig    `yaml:"jwt"`
 	Mode     string
+}
+
+type JWTConfig struct {
+	Secret string `yaml:"secret"`
 }
 
 type ServerConfig struct {

@@ -11,3 +11,6 @@ db:
 telegram:
   token: "7603634418:AAG13f97hlT-Qgj6easruzlX0cqbqzN-9zI" #codesigned_dev_bot
   webhook_url: ""
+jwt:
+  secret: "your-secret"
+  default_expiry_days: 180

@@ -10,13 +10,23 @@ import (
 )
 
 type UserHandler struct {
-	userUsecase usecase.UserService
+	userUsecase *usecase.UserService
 }
 
-func NewUserHandler(uc usecase.UserService) *UserHandler {
+func NewUserHandler(uc *usecase.UserService) *UserHandler {
 	return &UserHandler{userUsecase: uc}
 }
 
+// @Summary Привязка visitor_id к user
+// @Tags Users
+// @Accept json
+// @Produce json
+// @Param user_id path string true "User ID"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Security BearerAuth
+// @Router /users/{user_id}/link-visitor [post]
 func (h *UserHandler) LinkVisitorToUser(c echo.Context) error {
 	visitorIDRaw := c.Get(middleware.VisitorIDKey)
 	if visitorIDRaw == nil {
@@ -42,6 +52,12 @@ func (h *UserHandler) LinkVisitorToUser(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "visitor успешно связан с user"})
 }
 
+// @Summary Получить visitor_id
+// @Tags Visitors
+// @Produce json
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Router /visitor [get]
 func GetVisitorIDHandler(c echo.Context) error {
 	visitorID := c.Get(middleware.VisitorIDKey)
 	if visitorID == nil {

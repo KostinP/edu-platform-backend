@@ -1,28 +1,12 @@
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+DROP TABLE IF EXISTS user_inactivity_timeout;
 
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  telegram_id TEXT UNIQUE,
-  first_name TEXT,
-  last_name TEXT,
-  username TEXT,
-  photo_url TEXT,
-  email TEXT,
-  subscribe_to_newsletter BOOLEAN DEFAULT FALSE,
-  role TEXT NOT NULL DEFAULT 'unspecified',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW(),
-  deleted_at TIMESTAMP
-  visitor_id UUID NULL
-);
+DROP INDEX IF EXISTS idx_user_sessions_user_id;
+DROP INDEX IF EXISTS idx_user_sessions_last_active_at;
+DROP INDEX IF EXISTS idx_user_sessions_token;
+DROP TABLE IF EXISTS user_sessions;
 
-CREATE TABLE visitor_events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    visitor_id UUID NOT NULL, -- это UUID из куки, 
-    event_type TEXT NOT NULL, -- строка, описывающая событие, 
-    event_data JSONB, -- дополнительные данные в JSON (например, url, user agent и т.п.).
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+DROP INDEX IF EXISTS idx_visitor_events_visitor_id;
+DROP INDEX IF EXISTS idx_visitor_events_created_at;
+DROP TABLE IF EXISTS visitor_events;
 
-CREATE INDEX idx_visitor_events_visitor_id ON visitor_events(visitor_id);
-CREATE INDEX idx_visitor_events_created_at ON visitor_events(created_at);
+DROP TABLE IF EXISTS users;

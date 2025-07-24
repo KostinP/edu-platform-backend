@@ -1,0 +1,146 @@
+basePath: /api
+definitions:
+  transport.LogEventRequest:
+    properties:
+      event_data:
+        additionalProperties: {}
+        type: object
+      event_type:
+        type: string
+    required:
+    - event_type
+    type: object
+host: localhost:8080
+info:
+  contact:
+    email: support@edu-platform.com
+    name: Support Team
+  description: Backend for Edu Platform with gamification
+  license:
+    name: MIT
+  termsOfService: https://edu-platform.com/terms
+  title: Edu Platform API
+  version: "1.0"
+paths:
+  /telegram/auth:
+    post:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Авторизация через Telegram
+      tags:
+      - Telegram
+  /users/{user_id}/link-visitor:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: User ID
+        in: path
+        name: user_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Привязка visitor_id к user
+      tags:
+      - Users
+  /visitor:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Получить visitor_id
+      tags:
+      - Visitors
+  /visitor/events:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Событие
+        in: body
+        name: event
+        required: true
+        schema:
+          $ref: '#/definitions/transport.LogEventRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Логировать событие посетителя
+      tags:
+      - Visitors
+securityDefinitions:
+  BearerAuth:
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

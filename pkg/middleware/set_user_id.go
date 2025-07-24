@@ -7,8 +7,6 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-const UserIDKey = "user_id"
-
 func SetUserIDMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		userID := c.Request().Header.Get("X-User-ID")

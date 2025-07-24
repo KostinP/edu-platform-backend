@@ -11,3 +11,6 @@ db:
 telegram:
   token: "8034975066:AAFAHoaNHmbQlaUaL-VVsoUENas26rHdlwo" #codesigned_stage_bot
   webhook_url: "https://codesigned.ru/api/telegram/webhook"
+jwt:
+  secret: "your-secret"
+  default_expiry_days: 180

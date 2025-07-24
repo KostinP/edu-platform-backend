@@ -22,6 +22,15 @@ type LogEventRequest struct {
 	EventData map[string]any `json:"event_data"`
 }
 
+// @Summary Логировать событие посетителя
+// @Tags Visitors
+// @Accept json
+// @Produce json
+// @Param event body LogEventRequest true "Событие"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /visitor/events [post]
 func (h *VisitorEventHandler) LogEvent(c echo.Context) error {
 	visitorIDRaw := c.Get(middleware.VisitorIDKey)
 	if visitorIDRaw == nil {
