@@ -1,7 +1,7 @@
 # script/Makefile
 
 DB_URL ?= postgres://postgres:yourpassword@localhost:5432/edu_platform?sslmode=disable
-SWAGGER_DIRS := ./cmd,./api/http,./internal
+SWAGGER_DIRS := ./cmd,./internal/user/transport/http,./internal/user/entity
 MIGRATIONS_DIR := ./migrations
 
 .PHONY: swagger run tidy migrate-up migrate-down migrate-create deploy help

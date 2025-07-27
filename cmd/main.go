@@ -6,11 +6,24 @@ import (
 	"log"
 	"time"
 
-	"github.com/kostinp/edu-platform-backend/internal/user/usecase" // именно как пакет
+	_ "github.com/kostinp/edu-platform-backend/docs"
+	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
 	"github.com/kostinp/edu-platform-backend/pkg/config"
 	"github.com/kostinp/edu-platform-backend/pkg/logger"
 )
 
+// @title Edu Platform API
+// @version 1.0
+// @description Backend for Edu Platform with gamification
+// @termsOfService https://edu-platform.com/terms
+// @contact.name Support Team
+// @contact.email support@edu-platform.com
+// @license.name MIT
+// @host localhost:8080
+// @BasePath /api
+// @securityDefinitions.apikey BearerAuth
+// @in header
+// @name Authorization
 func main() {
 	cfg := config.Load()
 

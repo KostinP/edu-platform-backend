@@ -23,32 +23,37 @@ func newEchoServer(
 ) (*echo.Echo, error) {
 	e := echo.New()
 
-	// Swagger
+	// Swagger - публичный, без JWT
 	e.GET("/swagger/*", echoSwagger.WrapHandler)
 
+	// Health - публичный, без JWT
 	e.GET("/health", func(c echo.Context) error {
 		return c.JSON(200, map[string]string{"status": "ok"})
 	})
 
-	// Middleware
+	// Ваш JWT middleware
 	jwtMiddleware := middleware.JWTMiddleware([]byte(cfg.JWT.Secret), sessionUsecase)
-	e.Use(jwtMiddleware)
+
+	// Другие middleware, которые нужны для всех запросов
 	e.Use(middleware.VisitorMiddleware)
 	e.Use(middleware.SetUserIDMiddleware)
 	e.Use(middleware.LinkVisitorWithUser(userService))
 
-	// Роуты
+	// Публичные маршруты без JWT
 	e.POST("/api/users/:user_id/link-visitor", userHandler.LinkVisitorToUser)
 	e.GET("/api/visitor", transport.GetVisitorIDHandler)
 	e.POST("/api/visitor/events", visitorEventHandler.LogEvent)
 	e.POST("/api/telegram/auth", telegramAuthHandler.Auth)
 
-	// Защищённые роуты /me/* для сессий
-	meGroup := e.Group("/me", jwtMiddleware)
-	meGroup.GET("/sessions", sessionHandler.ListSessions)
-	meGroup.DELETE("/sessions/:id", sessionHandler.DeleteSession)
-	meGroup.POST("/inactivity-timeout", sessionHandler.SetInactivityTimeout)
-	meGroup.GET("/inactivity-timeout", sessionHandler.GetInactivityTimeout)
+	// Создаем группу для маршрутов, защищённых JWT
+	apiProtected := e.Group("/api")
+	apiProtected.Use(jwtMiddleware)
+
+	// Добавьте сюда все защищённые роуты, например:
+	apiProtected.GET("/me/sessions", sessionHandler.ListSessions)
+	apiProtected.DELETE("/me/sessions/:id", sessionHandler.DeleteSession)
+	apiProtected.POST("/me/inactivity-timeout", sessionHandler.SetInactivityTimeout)
+	apiProtected.GET("/me/inactivity-timeout", sessionHandler.GetInactivityTimeout)
 
 	return e, nil
 }
