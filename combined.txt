@@ -1,0 +1,2373 @@
+
+
+=== internal/user/repository/session_repository.go ===
+package repository
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kostinp/edu-platform-backend/internal/user/entity"
+)
+
+type SessionRepository interface {
+	Save(ctx context.Context, session *entity.UserSession) error
+	UpdateLastActive(ctx context.Context, sessionID uuid.UUID) error
+	FindByUserID(ctx context.Context, userID uuid.UUID) ([]*entity.UserSession, error)
+	Delete(ctx context.Context, userID, sessionID uuid.UUID) error
+	SaveInactivityTimeout(ctx context.Context, userID uuid.UUID, timeout time.Duration) error
+	GetInactivityTimeout(ctx context.Context, userID uuid.UUID) (time.Duration, error)
+	FindByID(ctx context.Context, sessionID uuid.UUID) (*entity.UserSession, error)
+	DeleteExpiredSessions(ctx context.Context) error
+}
+
+type PostgresSessionRepository struct {
+	db *pgxpool.Pool
+}
+
+func NewPostgresSessionRepository(db *pgxpool.Pool) *PostgresSessionRepository {
+	return &PostgresSessionRepository{db: db}
+}
+
+// Сохраняем сессию
+func (r *PostgresSessionRepository) Save(ctx context.Context, s *entity.UserSession) error {
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO user_sessions (
+			id, user_id, token, user_agent, ip_address, country, city, created_at, last_active_at, expires_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+	`,
+		s.ID, s.UserID, s.Token, s.UserAgent, s.IPAddress, s.Country, s.City,
+		s.CreatedAt, s.LastActiveAt, s.ExpiresAt,
+	)
+	return err
+}
+
+// Обновляем время последней активности
+func (r *PostgresSessionRepository) UpdateLastActive(ctx context.Context, sessionID uuid.UUID) error {
+	_, err := r.db.Exec(ctx, `
+		UPDATE user_sessions
+		SET last_active_at = NOW()
+		WHERE id = $1
+	`, sessionID)
+	return err
+}
+
+// Получаем список сессий пользователя
+func (r *PostgresSessionRepository) FindByUserID(ctx context.Context, userID uuid.UUID) ([]*entity.UserSession, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, token, user_agent, ip_address, country, city, created_at, last_active_at, expires_at
+		FROM user_sessions
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*entity.UserSession
+	for rows.Next() {
+		var s entity.UserSession
+		err := rows.Scan(
+			&s.ID, &s.Token, &s.UserAgent, &s.IPAddress, &s.Country, &s.City,
+			&s.CreatedAt, &s.LastActiveAt, &s.ExpiresAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		s.UserID = userID
+		sessions = append(sessions, &s)
+	}
+
+	return sessions, nil
+}
+
+// Удаление конкретной сессии
+func (r *PostgresSessionRepository) Delete(ctx context.Context, userID, sessionID uuid.UUID) error {
+	_, err := r.db.Exec(ctx, `
+		DELETE FROM user_sessions
+		WHERE id = $1 AND user_id = $2
+	`, sessionID, userID)
+	return err
+}
+
+// Храним таймаут неактивности (в секундах)
+func (r *PostgresSessionRepository) SaveInactivityTimeout(ctx context.Context, userID uuid.UUID, timeout time.Duration) error {
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO user_inactivity_timeout (user_id, timeout_seconds)
+		VALUES ($1, $2)
+		ON CONFLICT (user_id) DO UPDATE SET timeout_seconds = EXCLUDED.timeout_seconds
+	`, userID, int64(timeout.Seconds()))
+	return err
+}
+
+func (r *PostgresSessionRepository) GetInactivityTimeout(ctx context.Context, userID uuid.UUID) (time.Duration, error) {
+	var seconds int64
+	err := r.db.QueryRow(ctx, `
+		SELECT timeout_seconds FROM user_inactivity_timeout WHERE user_id = $1
+	`, userID).Scan(&seconds)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// По умолчанию 6 месяцев
+			return 4380 * time.Hour, nil
+		}
+		return 0, err
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+func (r *PostgresSessionRepository) FindByID(ctx context.Context, sessionID uuid.UUID) (*entity.UserSession, error) {
+	row := r.db.QueryRow(ctx, `
+		SELECT id, user_id, token, user_agent, ip_address, country, city, created_at, last_active_at, expires_at
+		FROM user_sessions
+		WHERE id = $1
+	`, sessionID)
+
+	var s entity.UserSession
+	err := row.Scan(
+		&s.ID, &s.UserID, &s.Token, &s.UserAgent, &s.IPAddress, &s.Country, &s.City,
+		&s.CreatedAt, &s.LastActiveAt, &s.ExpiresAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (r *PostgresSessionRepository) DeleteExpiredSessions(ctx context.Context) error {
+	query := `DELETE FROM user_sessions WHERE expires_at < NOW()`
+	_, err := r.db.Exec(ctx, query)
+	return err
+}
+
+
+=== internal/user/repository/user_repository.go ===
+package repository
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kostinp/edu-platform-backend/internal/user/entity"
+)
+
+type PostgresUserRepository struct {
+	pool *pgxpool.Pool
+}
+
+func NewPostgresUserRepository(pool *pgxpool.Pool) *PostgresUserRepository {
+	return &PostgresUserRepository{pool: pool}
+}
+
+func (r *PostgresUserRepository) Create(ctx context.Context, user *entity.User) error {
+	query := `
+		INSERT INTO users (
+			id, visitor_id, telegram_id, first_name, last_name, username, photo_url,
+			created_at, updated_at, deleted_at, email, subscribe_to_newsletter, role
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`
+
+	if user.ID == uuid.Nil {
+		user.ID = uuid.New()
+	}
+
+	var firstName, lastName string
+	if user.FullName != nil {
+		names := splitFullName(*user.FullName)
+		firstName = names[0]
+		if len(names) > 1 {
+			lastName = names[1]
+		}
+	}
+
+	_, err := r.pool.Exec(ctx, query,
+		user.ID,
+		user.VisitorID,
+		user.TelegramID,
+		firstName,
+		lastName,
+		user.Username,
+		user.PhotoURL,
+		user.CreatedAt,
+		user.UpdatedAt,
+		user.DeletedAt,
+		user.Email,
+		user.SubscribeToNews,
+		string(user.Role),
+	)
+	return err
+}
+
+func (r *PostgresUserRepository) Update(ctx context.Context, user *entity.User) error {
+	query := `
+		UPDATE users SET
+			visitor_id = $1,
+			telegram_id = $2,
+			first_name = $3,
+			last_name = $4,
+			username = $5,
+			photo_url = $6,
+			updated_at = $7,
+			deleted_at = $8,
+			email = $9,
+			subscribe_to_newsletter = $10,
+			role = $11
+		WHERE id = $12
+	`
+
+	var firstName, lastName string
+	if user.FullName != nil {
+		names := splitFullName(*user.FullName)
+		firstName = names[0]
+		if len(names) > 1 {
+			lastName = names[1]
+		}
+	}
+
+	cmdTag, err := r.pool.Exec(ctx, query,
+		user.VisitorID,
+		user.TelegramID,
+		firstName,
+		lastName,
+		user.Username,
+		user.PhotoURL,
+		user.UpdatedAt,
+		user.DeletedAt,
+		user.Email,
+		user.SubscribeToNews,
+		string(user.Role),
+		user.ID,
+	)
+	if err != nil {
+		return err
+	}
+
+	if cmdTag.RowsAffected() == 0 {
+		return errors.New("пользователь не найден для обновления")
+	}
+
+	return nil
+}
+
+func (r *PostgresUserRepository) GetByTelegramID(ctx context.Context, telegramID int64) (*entity.User, error) {
+	query := `
+		SELECT id, visitor_id, telegram_id, first_name, last_name, username, photo_url,
+		       created_at, updated_at, deleted_at, email, subscribe_to_newsletter, role
+		FROM users WHERE telegram_id = $1 AND deleted_at IS NULL
+	`
+
+	user := &entity.User{}
+	var firstName, lastName string
+
+	err := r.pool.QueryRow(ctx, query, telegramID).Scan(
+		&user.ID,
+		&user.VisitorID,
+		&user.TelegramID,
+		&firstName,
+		&lastName,
+		&user.Username,
+		&user.PhotoURL,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.DeletedAt,
+		&user.Email,
+		&user.SubscribeToNews,
+		&user.Role,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	fullName := combineFullName(firstName, lastName)
+	user.FullName = &fullName
+
+	return user, nil
+}
+
+func (r *PostgresUserRepository) GetByID(ctx context.Context, id uuid.UUID) (*entity.User, error) {
+	query := `
+		SELECT id, visitor_id, telegram_id, first_name, last_name, username, photo_url,
+		       created_at, updated_at, deleted_at, email, subscribe_to_newsletter, role
+		FROM users WHERE id = $1 AND deleted_at IS NULL
+	`
+
+	user := &entity.User{}
+	var firstName, lastName string
+
+	err := r.pool.QueryRow(ctx, query, id).Scan(
+		&user.ID,
+		&user.VisitorID,
+		&user.TelegramID,
+		&firstName,
+		&lastName,
+		&user.Username,
+		&user.PhotoURL,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.DeletedAt,
+		&user.Email,
+		&user.SubscribeToNews,
+		&user.Role,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	fullName := combineFullName(firstName, lastName)
+	user.FullName = &fullName
+
+	return user, nil
+}
+
+func splitFullName(fullName string) []string {
+	return strings.Fields(fullName) // лучше split по пробелам с trim
+}
+
+func combineFullName(firstName, lastName string) string {
+	if lastName == "" {
+		return firstName
+	}
+	return firstName + " " + lastName
+}
+
+
+=== internal/user/repository/visitor_event_repo.go ===
+package repository
+
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kostinp/edu-platform-backend/internal/user/entity"
+)
+
+type VisitorEventRepository interface {
+	Create(ctx context.Context, event *entity.VisitorEvent) error
+}
+
+type PostgresVisitorEventRepo struct {
+	pool *pgxpool.Pool
+}
+
+func NewPostgresVisitorEventRepo(pool *pgxpool.Pool) *PostgresVisitorEventRepo {
+	return &PostgresVisitorEventRepo{pool: pool}
+}
+
+func (r *PostgresVisitorEventRepo) Create(ctx context.Context, event *entity.VisitorEvent) error {
+	eventJSON, err := json.Marshal(event.EventData)
+	if err != nil {
+		return err
+	}
+
+	_, err = r.pool.Exec(ctx,
+		`INSERT INTO visitor_events (id, visitor_id, event_type, event_data) VALUES ($1, $2, $3, $4)`,
+		event.ID, event.VisitorID, event.EventType, eventJSON,
+	)
+	return err
+}
+
+
+=== internal/user/transport/http/telegram_auth_handler.go ===
+package transport
+
+import (
+	"net"
+	"net/http"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/kostinp/edu-platform-backend/internal/shared/config"
+	"github.com/kostinp/edu-platform-backend/internal/shared/geo"
+	"github.com/kostinp/edu-platform-backend/internal/shared/telegram"
+	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
+	"github.com/labstack/echo/v4"
+)
+
+type TelegramAuthHandler struct {
+	userService *usecase.UserService
+	botToken    string
+	jwtSecret   []byte
+}
+
+func NewTelegramAuthHandler(userService *usecase.UserService, botToken config.BotToken, jwtSecret config.JwtSecret) *TelegramAuthHandler {
+	return &TelegramAuthHandler{
+		userService: userService,
+		botToken:    string(botToken),
+		jwtSecret:   []byte(jwtSecret),
+	}
+}
+
+// @Summary Авторизация через Telegram
+// @Tags Telegram
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /telegram/auth [post]
+func (h *TelegramAuthHandler) Auth(c echo.Context) error {
+	authData := telegram.ParseTelegramAuth(c.Request())
+
+	if !telegram.VerifyTelegramAuth(authData, h.botToken) {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid telegram auth"})
+	}
+
+	ctx := c.Request().Context()
+
+	user, err := h.userService.GetByTelegramID(ctx, authData.ID)
+	if err != nil {
+		user, err = h.userService.CreateFromTelegramAuth(ctx, authData)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "не удалось создать пользователя"})
+		}
+	}
+
+	// Получаем данные сессии
+	ip := getIP(c)
+	userAgent := c.Request().UserAgent()
+	country, city := geo.Lookup(ip)
+
+	// Создаем сессию пользователя в БД
+	session, err := h.userService.CreateUserSession(ctx, user.ID, ip, userAgent, country, city)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "не удалось создать сессию"})
+	}
+
+	// По умолчанию — 6 месяцев
+	expiration := time.Now().AddDate(0, 6, 0)
+
+	// Генерация JWT
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":    user.ID.String(),
+		"session_id": session.ID.String(),
+		"exp":        expiration.Unix(),
+		"iat":        time.Now().Unix(),
+	})
+
+	tokenString, err := token.SignedString(h.jwtSecret)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "не удалось создать токен"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"token":      tokenString,
+		"user_id":    user.ID.String(),
+		"session_id": session.ID.String(),
+		"username":   user.Username,
+		"full_name":  user.FullName,
+		"role":       user.Role,
+	})
+}
+
+// Получение IP-адреса из запроса
+func getIP(c echo.Context) string {
+	ip := c.Request().Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip, _, _ = net.SplitHostPort(c.Request().RemoteAddr)
+	}
+	return ip
+}
+
+
+=== internal/user/transport/http/visitor_event_handler.go ===
+package transport
+
+import (
+	"net/http"
+
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/shared/middleware"
+	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
+	"github.com/labstack/echo/v4"
+)
+
+type VisitorEventHandler struct {
+	usecase usecase.VisitorEventUsecase
+}
+
+func NewVisitorEventHandler(uc usecase.VisitorEventUsecase) *VisitorEventHandler {
+	return &VisitorEventHandler{usecase: uc}
+}
+
+type LogEventRequest struct {
+	EventType string         `json:"event_type" validate:"required"`
+	EventData map[string]any `json:"event_data"`
+}
+
+// @Summary Логировать событие посетителя
+// @Tags Visitors
+// @Accept json
+// @Produce json
+// @Param event body LogEventRequest true "Событие"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /visitor/events [post]
+func (h *VisitorEventHandler) LogEvent(c echo.Context) error {
+	visitorIDRaw := c.Get(middleware.VisitorIDKey)
+	if visitorIDRaw == nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "visitor_id отсутствует"})
+	}
+
+	visitorID, err := uuid.Parse(visitorIDRaw.(string))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid visitor_id"})
+	}
+
+	req := new(LogEventRequest)
+	if err := c.Bind(req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "неверный формат запроса"})
+	}
+
+	if err := c.Validate(req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+
+	err = h.usecase.LogEvent(c.Request().Context(), visitorID, req.EventType, req.EventData)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "не удалось сохранить событие"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "событие сохранено"})
+}
+
+
+=== internal/user/transport/http/session_handler.go ===
+package transport
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/user/entity"
+	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
+	"github.com/labstack/echo/v4"
+)
+
+type SessionHandler struct {
+	SessionUsecase usecase.SessionUsecase
+}
+
+func NewSessionHandler(sessionUC usecase.SessionUsecase) *SessionHandler {
+	return &SessionHandler{SessionUsecase: sessionUC}
+}
+
+// SetInactivityTimeoutRequest — структура запроса для установки таймаута бездействия.
+// @Description Таймаут в секундах.
+type SetInactivityTimeoutRequest struct {
+	// Таймаут в секундах
+	TimeoutSeconds int64 `json:"timeout_seconds" example:"3600"`
+}
+
+// ListSessions возвращает все сессии пользователя
+// @Summary Получить список сессий пользователя
+// @Tags Session
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {array} entity.UserSession
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /me/sessions [get]
+func (h *SessionHandler) ListSessions(c echo.Context) error {
+	userIDStr := c.Get("user_id").(string)
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	rawSessions, err := h.SessionUsecase.ListSessions(c.Request().Context(), userID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
+	}
+
+	sessions := make([]entity.UserSession, 0, len(rawSessions))
+	for _, s := range rawSessions {
+		sessions = append(sessions, *s) // разыменовываем указатель
+	}
+
+	return c.JSON(http.StatusOK, sessions)
+}
+
+// DeleteSession удаляет указанную сессию пользователя
+// @Summary Удалить сессию по ID
+// @Tags Session
+// @Security BearerAuth
+// @Param id path string true "ID сессии"
+// @Success 204 {string} string "No Content"
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /me/sessions/{id} [delete]
+func (h *SessionHandler) DeleteSession(c echo.Context) error {
+	userIDStr := c.Get("user_id").(string)
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	sessionIDStr := c.Param("id")
+	sessionID, err := uuid.Parse(sessionIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid session id"})
+	}
+
+	err = h.SessionUsecase.DeleteSession(c.Request().Context(), userID, sessionID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete session"})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+// SetInactivityTimeout устанавливает таймаут неактивности для пользователя
+// @Summary Установить таймаут неактивности
+// @Tags Session
+// @Security BearerAuth
+// @Accept json
+// @Produce json
+// @Param request body SetInactivityTimeoutRequest true "Таймаут в секундах"
+// @Success 204 {string} string "No Content"
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /me/inactivity-timeout [post]
+func (h *SessionHandler) SetInactivityTimeout(c echo.Context) error {
+	userIDStr := c.Get("user_id").(string)
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	type Request struct {
+		TimeoutSeconds int64 `json:"timeout_seconds"`
+	}
+
+	req := new(Request)
+	if err := c.Bind(req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+	}
+
+	timeout := time.Duration(req.TimeoutSeconds) * time.Second
+	if timeout < 0 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "timeout must be positive"})
+	}
+
+	err = h.SessionUsecase.SetInactivityTimeout(c.Request().Context(), userID, timeout)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set inactivity timeout"})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+// GetInactivityTimeout возвращает текущий таймаут неактивности пользователя
+// @Summary Получить таймаут неактивности
+// @Tags Session
+// @Security BearerAuth
+// @Produce json
+// @Success 200 {object} map[string]int64
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /me/inactivity-timeout [get]
+func (h *SessionHandler) GetInactivityTimeout(c echo.Context) error {
+	userIDStr := c.Get("user_id").(string)
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	timeout, err := h.SessionUsecase.GetInactivityTimeout(c.Request().Context(), userID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get inactivity timeout"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"timeout_seconds": int64(timeout.Seconds()),
+	})
+}
+
+
+=== internal/user/transport/http/user_handler.go ===
+package transport
+
+import (
+	"net/http"
+
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/shared/middleware"
+	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
+	"github.com/labstack/echo/v4"
+)
+
+type UserHandler struct {
+	userUsecase *usecase.UserService
+}
+
+func NewUserHandler(uc *usecase.UserService) *UserHandler {
+	return &UserHandler{userUsecase: uc}
+}
+
+// @Summary Привязка visitor_id к user
+// @Tags Users
+// @Accept json
+// @Produce json
+// @Param user_id path string true "User ID"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Security BearerAuth
+// @Router /users/{user_id}/link-visitor [post]
+func (h *UserHandler) LinkVisitorToUser(c echo.Context) error {
+	visitorIDRaw := c.Get(middleware.VisitorIDKey)
+	if visitorIDRaw == nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "visitor_id не найден"})
+	}
+
+	visitorID, err := uuid.Parse(visitorIDRaw.(string))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "некорректный visitor_id"})
+	}
+
+	userIDParam := c.Param("user_id") // предполагаем, что ты передаёшь user_id в URL
+	userID, err := uuid.Parse(userIDParam)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "некорректный user_id"})
+	}
+
+	err = h.userUsecase.LinkVisitorToUser(c.Request().Context(), userID, visitorID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "visitor успешно связан с user"})
+}
+
+// @Summary Получить visitor_id
+// @Tags Visitors
+// @Produce json
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Router /visitor [get]
+func GetVisitorIDHandler(c echo.Context) error {
+	visitorID := c.Get(middleware.VisitorIDKey)
+	if visitorID == nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "visitor_id not found"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{
+		"visitor_id": visitorID.(string),
+		"message":    "Привет, гость!",
+	})
+}
+
+
+=== internal/user/entity/user.go ===
+package entity
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Role string
+
+const (
+	RoleUnspecified Role = "unspecified"
+	RoleGuest       Role = "guest"
+	RoleStudent     Role = "student"
+	RoleTeacher     Role = "teacher"
+	RoleAdmin       Role = "admin"
+)
+
+type User struct {
+	ID              uuid.UUID  `json:"id"`
+	VisitorID       *uuid.UUID `json:"visitor_id,omitempty"`
+	TelegramID      *int64     `json:"telegram_id,omitempty"`
+	Username        *string    `json:"username,omitempty"`
+	FullName        *string    `json:"full_name,omitempty"`
+	PhotoURL        *string    `json:"photo_url,omitempty"`
+	Email           *string    `json:"email,omitempty"`
+	SubscribeToNews bool       `json:"subscribe_to_newsletter"`
+	Role            Role       `json:"role"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+=== internal/user/entity/session.go ===
+package entity
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// UserSession модель сессии пользователя
+type UserSession struct {
+	ID           uuid.UUID `json:"id" example:"123e4567-e89b-12d3-a456-426614174000"`
+	UserID       uuid.UUID `json:"user_id" example:"123e4567-e89b-12d3-a456-426614174001"`
+	Token        string    `json:"token" example:"jwt.token.here"`
+	UserAgent    string    `json:"user_agent" example:"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"`
+	IPAddress    string    `json:"ip_address" example:"192.168.1.1"`
+	Country      string    `json:"country" example:"Russia"`
+	City         string    `json:"city" example:"Moscow"`
+	CreatedAt    time.Time `json:"created_at" example:"2025-07-24T18:25:43.511Z"`
+	LastActiveAt time.Time `json:"last_active_at" example:"2025-07-25T10:15:00.000Z"`
+	ExpiresAt    time.Time `json:"expires_at" example:"2025-08-24T18:25:43.511Z"`
+}
+
+
+=== internal/user/entity/visitor_event.go ===
+package entity
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type VisitorEvent struct {
+	ID        uuid.UUID      `json:"id"`
+	VisitorID uuid.UUID      `json:"visitor_id"`
+	EventType string         `json:"event_type"`
+	EventData map[string]any `json:"event_data,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+
+
+=== internal/user/usecase/user_usecase.go ===
+package usecase
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/shared/telegram"
+	"github.com/kostinp/edu-platform-backend/internal/user/entity"
+)
+
+// UserRepository описывает методы репозитория, которые нужны сервису
+type UserRepository interface {
+	Create(ctx context.Context, user *entity.User) error
+	Update(ctx context.Context, user *entity.User) error
+	GetByTelegramID(ctx context.Context, telegramID int64) (*entity.User, error)
+	GetByID(ctx context.Context, id uuid.UUID) (*entity.User, error) // лучше UUID, чтобы совпадало с типом
+}
+
+// UserService реализует бизнес-логику для пользователей
+type UserService struct {
+	sessionUC SessionUsecase
+	repo      UserRepository
+}
+
+// NewUserService создаёт UserService с переданным репозиторием
+func NewUserService(repo UserRepository, sessionUC SessionUsecase) *UserService {
+	return &UserService{
+		repo:      repo,
+		sessionUC: sessionUC,
+	}
+}
+
+// CreateGuestUser создаёт нового гостевого пользователя
+func (s *UserService) CreateGuestUser(ctx context.Context) (*entity.User, error) {
+	user := &entity.User{
+		Role:      entity.RoleGuest,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	err := s.repo.Create(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// UpgradeToTelegramUser обновляет гостя до пользователя с TelegramID и ролью student по умолчанию
+func (s *UserService) UpgradeToTelegramUser(ctx context.Context, userID uuid.UUID, telegramID int64, username, fullName string) (*entity.User, error) {
+	user, err := s.repo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, errors.New("пользователь не найден")
+	}
+
+	user.TelegramID = &telegramID
+	user.Username = &username
+	user.FullName = &fullName
+	user.Role = entity.RoleStudent
+	user.UpdatedAt = time.Now()
+
+	err = s.repo.Update(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// LinkVisitorToUser связывает посетителя (visitor) с пользователем (user)
+func (s *UserService) LinkVisitorToUser(ctx context.Context, userID, visitorID uuid.UUID) error {
+	user, err := s.repo.GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("не удалось найти пользователя: %w", err)
+	}
+	if user == nil {
+		return errors.New("пользователь не найден")
+	}
+
+	user.VisitorID = &visitorID
+	user.UpdatedAt = time.Now()
+
+	if err := s.repo.Update(ctx, user); err != nil {
+		return fmt.Errorf("не удалось обновить пользователя: %w", err)
+	}
+	return nil
+}
+
+// GetByTelegramID возвращает пользователя по Telegram ID
+func (s *UserService) GetByTelegramID(ctx context.Context, telegramID int64) (*entity.User, error) {
+	return s.repo.GetByTelegramID(ctx, telegramID)
+}
+
+// CreateFromTelegramAuth создает нового пользователя из Telegram-авторизации
+func (s *UserService) CreateFromTelegramAuth(ctx context.Context, data telegram.AuthData) (*entity.User, error) {
+	user := &entity.User{
+		TelegramID: &data.ID,
+		Username:   &data.Username,
+		FullName:   &data.FirstName,
+		Role:       entity.RoleStudent,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	err := s.repo.Create(ctx, user)
+	return user, err
+}
+
+func (s *UserService) CreateUserSession(
+	ctx context.Context,
+	userID uuid.UUID,
+	ip, userAgent, country, city string,
+) (*entity.UserSession, error) {
+	// Срок жизни — 6 месяцев
+	expiresIn := time.Hour * 24 * 30 * 6
+
+	token := uuid.New().String() // можно использовать как внутренний ID
+	return s.sessionUC.CreateSession(ctx, userID, token, userAgent, ip, country, city, expiresIn)
+}
+
+
+=== internal/user/usecase/session_usecase.go ===
+package usecase
+
+import (
+	"context"
+	"time"
+
+	"github.com/kostinp/edu-platform-backend/internal/user/repository"
+
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/user/entity"
+)
+
+// Интерфейс для SessionUsecase, который будет использоваться в wire.Bind
+type SessionUsecase interface {
+	CreateSession(ctx context.Context, userID uuid.UUID, token, userAgent, ip, country, city string, expiresIn time.Duration) (*entity.UserSession, error)
+	UpdateLastActive(ctx context.Context, sessionID uuid.UUID) error
+	ListSessions(ctx context.Context, userID uuid.UUID) ([]*entity.UserSession, error)
+	DeleteSession(ctx context.Context, userID, sessionID uuid.UUID) error
+	SetInactivityTimeout(ctx context.Context, userID uuid.UUID, timeout time.Duration) error
+	GetInactivityTimeout(ctx context.Context, userID uuid.UUID) (time.Duration, error)
+	GetSessionByID(ctx context.Context, sessionID uuid.UUID) (*entity.UserSession, error)
+	DeleteExpiredSessions(ctx context.Context) error
+}
+
+// Структура-реализация
+type SessionUsecaseImpl struct {
+	repo repository.SessionRepository
+}
+
+// Конструктор
+func NewSessionUsecase(repo repository.SessionRepository) *SessionUsecaseImpl {
+	return &SessionUsecaseImpl{repo: repo}
+}
+
+// Реализация методов
+
+func (s *SessionUsecaseImpl) CreateSession(
+	ctx context.Context,
+	userID uuid.UUID,
+	token, userAgent, ip, country, city string,
+	expiresIn time.Duration,
+) (*entity.UserSession, error) {
+	now := time.Now()
+	session := &entity.UserSession{
+		ID:           uuid.New(),
+		UserID:       userID,
+		Token:        token,
+		UserAgent:    userAgent,
+		IPAddress:    ip,
+		Country:      country,
+		City:         city,
+		CreatedAt:    now,
+		LastActiveAt: now,
+		ExpiresAt:    now.Add(expiresIn),
+	}
+	if err := s.repo.Save(ctx, session); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+func (s *SessionUsecaseImpl) UpdateLastActive(ctx context.Context, sessionID uuid.UUID) error {
+	return s.repo.UpdateLastActive(ctx, sessionID)
+}
+
+func (s *SessionUsecaseImpl) ListSessions(ctx context.Context, userID uuid.UUID) ([]*entity.UserSession, error) {
+	return s.repo.FindByUserID(ctx, userID)
+}
+
+func (s *SessionUsecaseImpl) DeleteSession(ctx context.Context, userID, sessionID uuid.UUID) error {
+	return s.repo.Delete(ctx, userID, sessionID)
+}
+
+func (s *SessionUsecaseImpl) SetInactivityTimeout(ctx context.Context, userID uuid.UUID, timeout time.Duration) error {
+	return s.repo.SaveInactivityTimeout(ctx, userID, timeout)
+}
+
+func (s *SessionUsecaseImpl) GetInactivityTimeout(ctx context.Context, userID uuid.UUID) (time.Duration, error) {
+	return s.repo.GetInactivityTimeout(ctx, userID)
+}
+
+func (s *SessionUsecaseImpl) GetSessionByID(ctx context.Context, sessionID uuid.UUID) (*entity.UserSession, error) {
+	return s.repo.FindByID(ctx, sessionID)
+}
+
+func (s *SessionUsecaseImpl) DeleteExpiredSessions(ctx context.Context) error {
+	return s.repo.DeleteExpiredSessions(ctx)
+}
+
+
+=== internal/user/usecase/visitor_event_usecase.go ===
+package usecase
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/user/entity"
+	"github.com/kostinp/edu-platform-backend/internal/user/repository"
+)
+
+type VisitorEventUsecase interface {
+	LogEvent(ctx context.Context, visitorID uuid.UUID, eventType string, eventData map[string]any) error
+}
+
+type visitorEventUsecase struct {
+	repo repository.VisitorEventRepository
+}
+
+func NewVisitorEventUsecase(repo repository.VisitorEventRepository) VisitorEventUsecase {
+	return &visitorEventUsecase{repo: repo}
+}
+
+func (u *visitorEventUsecase) LogEvent(ctx context.Context, visitorID uuid.UUID, eventType string, eventData map[string]any) error {
+	event := &entity.VisitorEvent{
+		ID:        uuid.New(),
+		VisitorID: visitorID,
+		EventType: eventType,
+		EventData: eventData,
+		CreatedAt: time.Now(),
+	}
+	return u.repo.Create(ctx, event)
+}
+
+
+=== internal/user/usecase/session_cleanup.go ===
+package usecase
+
+import (
+	"context"
+	"log"
+	"time"
+)
+
+func StartSessionCleanupTask(ctx context.Context, sessionUC SessionUsecase, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := sessionUC.DeleteExpiredSessions(ctx); err != nil {
+					log.Printf("session cleanup error: %v", err)
+				} else {
+					log.Printf("session cleanup completed")
+				}
+			case <-ctx.Done():
+				log.Printf("session cleanup stopped")
+				return
+			}
+		}
+	}()
+}
+
+
+=== internal/shared/dto/pagination_response.go ===
+package dto
+
+type PaginatedResponse[T any] struct {
+	Items  []T `json:"items"`
+	Total  int `json:"total"`
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+}
+
+
+=== internal/shared/middleware/set_user_id.go ===
+package middleware
+
+import (
+	"net/http"
+
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+)
+
+func SetUserIDMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		userID := c.Request().Header.Get("X-User-ID")
+		if userID == "" {
+			return next(c)
+		}
+
+		id, err := uuid.Parse(userID)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user_id"})
+		}
+
+		c.Set(UserIDKey, id)
+		return next(c)
+	}
+}
+
+
+=== internal/shared/middleware/context_keys.go ===
+package middleware
+
+const UserIDKey = "user_id"
+
+
+=== internal/shared/middleware/visitor.go ===
+package middleware
+
+import (
+	"net/http"
+
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+)
+
+const VisitorIDKey = "visitor_id"
+
+func VisitorMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		cookie, err := c.Cookie(VisitorIDKey)
+		if err != nil || cookie.Value == "" {
+			// Создаем новый visitor_id
+			newVisitorID := uuid.NewString()
+			cookie = &http.Cookie{
+				Name:     VisitorIDKey,
+				Value:    newVisitorID,
+				Path:     "/",
+				HttpOnly: true,
+				MaxAge:   365 * 24 * 60 * 60, // 1 год
+				Secure:   false,              // поменять на true при HTTPS
+				SameSite: http.SameSiteLaxMode,
+			}
+			c.SetCookie(cookie)
+		}
+
+		// Добавляем visitor_id в контекст Echo
+		c.Set(VisitorIDKey, cookie.Value)
+
+		return next(c)
+	}
+}
+
+
+=== internal/shared/middleware/jwt.go ===
+package middleware
+
+import (
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
+	"github.com/labstack/echo/v4"
+)
+
+func JWTMiddleware(jwtSecret []byte, sessionUC usecase.SessionUsecase) echo.MiddlewareFunc {
+	const refreshThreshold = 24 * time.Hour // обновляем если токен истекает менее чем через 1 день
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			authHeader := c.Request().Header.Get("Authorization")
+			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+				return echo.NewHTTPError(http.StatusUnauthorized, "missing or invalid authorization header")
+			}
+
+			tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
+			token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, echo.NewHTTPError(http.StatusUnauthorized, "unexpected signing method")
+				}
+				return jwtSecret, nil
+			})
+
+			if err != nil || !token.Valid {
+				return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
+			}
+
+			claims, ok := token.Claims.(jwt.MapClaims)
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "invalid token claims")
+			}
+
+			sessionIDStr, ok := claims["session_id"].(string)
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "session_id missing")
+			}
+
+			userIDStr, ok := claims["user_id"].(string)
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "user_id missing")
+			}
+
+			expFloat, ok := claims["exp"].(float64)
+			if !ok {
+				return echo.NewHTTPError(http.StatusUnauthorized, "exp missing")
+			}
+
+			expiration := time.Unix(int64(expFloat), 0)
+			now := time.Now()
+			if now.After(expiration) {
+				return echo.NewHTTPError(http.StatusUnauthorized, "token expired")
+			}
+
+			sessionID, err := uuid.Parse(sessionIDStr)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusUnauthorized, "invalid session_id format")
+			}
+
+			session, err := sessionUC.GetSessionByID(c.Request().Context(), sessionID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusUnauthorized, "session not found or expired")
+			}
+
+			if now.After(session.ExpiresAt) {
+				// Удаляем просроченную сессию из БД
+				_ = sessionUC.DeleteSession(c.Request().Context(), session.UserID, session.ID)
+				return echo.NewHTTPError(http.StatusUnauthorized, "session expired")
+			}
+
+			// Обновляем last_active_at
+			if err := sessionUC.UpdateLastActive(c.Request().Context(), sessionID); err != nil {
+				c.Logger().Errorf("failed to update session last active: %v", err)
+			}
+
+			// Если токен истекает менее чем через refreshThreshold, создаём новый
+			timeLeft := expiration.Sub(now)
+			if timeLeft < refreshThreshold {
+				newExpiration := now.AddDate(0, 6, 0)
+				newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+					"user_id":    userIDStr,
+					"session_id": sessionIDStr,
+					"exp":        newExpiration.Unix(),
+					"iat":        now.Unix(),
+				})
+
+				newTokenString, err := newToken.SignedString(jwtSecret)
+				if err != nil {
+					c.Logger().Errorf("failed to sign new token: %v", err)
+				} else {
+					c.Response().Header().Set("X-Refresh-Token", newTokenString)
+				}
+			}
+
+			c.Set("user_id", userIDStr)
+			c.Set("session_id", sessionIDStr)
+
+			return next(c)
+		}
+	}
+}
+
+
+=== internal/shared/middleware/link_visitor_user.go ===
+package middleware
+
+import (
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
+	"github.com/labstack/echo/v4"
+)
+
+func LinkVisitorWithUser(userUC *usecase.UserService) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			visitorIDRaw := c.Get(VisitorIDKey)
+			userIDRaw := c.Get(UserIDKey)
+
+			if visitorIDRaw == nil || userIDRaw == nil {
+				// Логика: либо гость, либо неавторизованный пользователь — пропускаем
+				return next(c)
+			}
+
+			visitorID, err := uuid.Parse(visitorIDRaw.(string))
+			if err != nil {
+				// Логировать ошибку можно, но не прерывать
+				return next(c)
+			}
+
+			userID, ok := userIDRaw.(uuid.UUID)
+			if !ok {
+				// Логировать ошибку можно, но не прерывать
+				return next(c)
+			}
+
+			// Пробуем связать visitor и user
+			if err := userUC.LinkVisitorToUser(c.Request().Context(), userID, visitorID); err != nil {
+				// Логгируем ошибку, но не блокируем запрос
+				// Например: logger.Warnf("LinkVisitorWithUser: %v", err)
+			}
+
+			return next(c)
+		}
+	}
+}
+
+
+=== internal/shared/pagination/params.go ===
+package pagination
+
+import (
+	"fmt"
+	"strings"
+)
+
+type Params struct {
+	Limit  int    `json:"limit"`
+	Offset int    `json:"offset"`
+	SortBy string `json:"sort_by"`
+	Order  string `json:"order"`
+}
+
+const (
+	DefaultLimit  = 20
+	MaxLimit      = 100
+	DefaultOffset = 0
+	DefaultOrder  = "asc"
+)
+
+// Normalize — корректирует значения Limit, Offset, Order
+func (p *Params) Normalize() {
+	if p.Limit <= 0 || p.Limit > MaxLimit {
+		p.Limit = DefaultLimit
+	}
+	if p.Offset < 0 {
+		p.Offset = DefaultOffset
+	}
+	if p.Order != "asc" && p.Order != "desc" {
+		p.Order = DefaultOrder
+	}
+}
+
+// SQLWithPagination — генерирует SQL с LIMIT, OFFSET и ORDER BY
+func SQLWithPagination(baseQuery string, p Params, allowedSortFields map[string]string) (string, []interface{}) {
+	var clauses []string
+
+	if p.SortBy != "" && allowedSortFields != nil {
+		if dbField, ok := allowedSortFields[p.SortBy]; ok {
+			clauses = append(clauses, fmt.Sprintf("ORDER BY %s %s", dbField, strings.ToUpper(p.Order)))
+		}
+	}
+
+	clauses = append(clauses, "LIMIT $1 OFFSET $2")
+
+	sql := baseQuery + " " + strings.Join(clauses, " ")
+	args := []interface{}{p.Limit, p.Offset}
+
+	return sql, args
+}
+
+
+=== internal/shared/pagination/http.go ===
+package pagination
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/labstack/echo/v4"
+)
+
+// PaginationQueryParams — DTO для парсинга query-параметров из запроса
+type PaginationQueryParams struct {
+	Limit  int
+	Offset int
+	SortBy string
+	Order  string
+}
+
+// ParsePaginationParams — парсит query-параметры из echo.Context
+func ParsePaginationParams(c echo.Context) PaginationQueryParams {
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	offset, _ := strconv.Atoi(c.QueryParam("offset"))
+	sortBy := strings.TrimSpace(c.QueryParam("sort_by"))
+	order := strings.ToLower(c.QueryParam("order"))
+
+	if limit <= 0 || limit > MaxLimit {
+		limit = DefaultLimit
+	}
+	if offset < 0 {
+		offset = DefaultOffset
+	}
+	if order != "asc" && order != "desc" {
+		order = DefaultOrder
+	}
+
+	return PaginationQueryParams{
+		Limit:  limit,
+		Offset: offset,
+		SortBy: sortBy,
+		Order:  order,
+	}
+}
+
+// ToDomainParams — конвертирует HTTP DTO в доменный тип Params
+func (p PaginationQueryParams) ToDomainParams() Params {
+	return Params{
+		Limit:  p.Limit,
+		Offset: p.Offset,
+		SortBy: p.SortBy,
+		Order:  p.Order,
+	}
+}
+
+
+=== internal/shared/logger/logger.go ===
+package logger
+
+import (
+	"log"
+	"os"
+)
+
+var (
+	infoLogger  = log.New(os.Stdout, "INFO: ", log.LstdFlags|log.Lshortfile)
+	errorLogger = log.New(os.Stderr, "ОШИБКА: ", log.LstdFlags|log.Lshortfile)
+)
+
+func Info(msg string) {
+	infoLogger.Println(msg)
+}
+
+func Error(msg string, err error) {
+	errorLogger.Printf("%s: %v\n", msg, err)
+}
+
+func Fatal(msg string, err error) {
+	errorLogger.Fatalf("%s: %v\n", msg, err)
+}
+
+
+=== internal/shared/config/config.go ===
+package config
+
+import (
+	"log"
+	"os"
+
+	"gopkg.in/yaml.v3"
+)
+
+type Config struct {
+	Server   ServerConfig `yaml:"server"`
+	DB       DBConfig     `yaml:"db"`
+	Telegram Telegram     `yaml:"telegram"`
+	JWT      JWTConfig    `yaml:"jwt"`
+	Mode     string
+}
+
+type JWTConfig struct {
+	Secret string `yaml:"secret"`
+}
+
+type ServerConfig struct {
+	Port int `yaml:"port"`
+}
+
+type DBConfig struct {
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Name     string `yaml:"name"`
+}
+
+type Telegram struct {
+	Token string `yaml:"token"`
+}
+
+func Load() *Config {
+	mode := os.Getenv("APP_ENV")
+	if mode == "" {
+		mode = "dev"
+	}
+
+	path := "./configs/" + mode + ".yaml"
+	file, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("Не удалось прочитать конфигурационный файл: %v", err)
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(file, &cfg); err != nil {
+		log.Fatalf("Не удалось распарсить конфигурационный файл: %v", err)
+	}
+
+	cfg.Mode = mode
+	return &cfg
+}
+
+
+=== internal/shared/config/types.go ===
+package config
+
+type BotToken string
+type JwtSecret string
+
+
+=== internal/shared/entity/base.go ===
+package entity
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Base struct {
+	ID        uuid.UUID `json:"id" db:"id"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+	AuthorID  uuid.UUID `json:"author_id" db:"author_id"`
+}
+
+func (b *Base) Init(authorID uuid.UUID) {
+	b.ID = uuid.New()
+	now := time.Now().UTC()
+	b.CreatedAt = now
+	b.UpdatedAt = now
+	b.AuthorID = authorID
+}
+
+func (b *Base) Touch() {
+	b.UpdatedAt = time.Now().UTC()
+}
+
+
+=== internal/shared/geo/geo.go ===
+package geo
+
+// Простая заглушка для локальной разработки
+func Lookup(ip string) (country, city string) {
+	return "Unknown", "Unknown"
+}
+
+
+=== internal/shared/telegram/bot.go ===
+package telegram
+
+import (
+	"log"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+func New(token string) (*tgbotapi.BotAPI, error) {
+	bot, err := tgbotapi.NewBotAPI(token)
+	if err != nil {
+		return nil, err
+	}
+
+	bot.Debug = true
+	log.Printf("Telegram bot authorized on account %s", bot.Self.UserName)
+	return bot, nil
+}
+
+
+=== internal/shared/telegram/oauth.go ===
+package telegram
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strconv"
+)
+
+type AuthData struct {
+	ID        int64
+	Username  string
+	FirstName string
+	Hash      string
+}
+
+func ParseTelegramAuth(r *http.Request) AuthData {
+	return AuthData{
+		ID:        parseInt64(r.FormValue("id")),
+		Username:  r.FormValue("username"),
+		FirstName: r.FormValue("first_name"),
+		Hash:      r.FormValue("hash"),
+	}
+}
+
+func VerifyTelegramAuth(authData AuthData, botToken string) bool {
+	secretKey := sha256.Sum256([]byte(botToken))
+
+	dataCheckString := fmt.Sprintf("first_name=%s\nid=%d\nusername=%s", authData.FirstName, authData.ID, authData.Username)
+
+	h := hmac.New(sha256.New, secretKey[:])
+	h.Write([]byte(dataCheckString))
+	hash := hex.EncodeToString(h.Sum(nil))
+
+	return hash == authData.Hash
+}
+
+func parseInt64(s string) int64 {
+	i, _ := strconv.ParseInt(s, 10, 64)
+	return i
+}
+
+
+=== internal/shared/db/postgres.go ===
+package db
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kostinp/edu-platform-backend/internal/shared/config"
+	"github.com/kostinp/edu-platform-backend/internal/shared/logger"
+)
+
+func ConnectPostgres(cfg *config.Config) *pgxpool.Pool {
+	dsn := fmt.Sprintf(
+		"postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		cfg.DB.User,
+		cfg.DB.Password,
+		cfg.DB.Host,
+		cfg.DB.Port,
+		cfg.DB.Name,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dbPool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		logger.Fatal("Не удалось подключиться к базе данных", err)
+	}
+
+	if err := dbPool.Ping(ctx); err != nil {
+		logger.Fatal("База данных недоступна", err)
+	}
+
+	logger.Info("Подключение к базе данных установлено")
+	return dbPool
+}
+
+
+=== internal/shared/db/redis.go ===
+// pkg/db/redis.go
+package db
+
+import (
+	"github.com/redis/go-redis/v9"
+)
+
+type Redis struct {
+	Client *redis.Client
+}
+
+func NewRedis(url string) (*Redis, error) {
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		return nil, err
+	}
+
+	client := redis.NewClient(opts)
+	return &Redis{Client: client}, nil
+}
+
+
+=== internal/tag/repository/tag_assignment_repository.go ===
+package repository
+
+import (
+	"context"
+	"errors"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kostinp/edu-platform-backend/internal/tag/entity"
+)
+
+var ErrTagAssignmentNotFound = errors.New("tag assignment not found")
+
+type TagAssignmentRepository interface {
+	Assign(ctx context.Context, assignment *entity.TagAssignment) error
+	Unassign(ctx context.Context, id uuid.UUID, entityID uuid.UUID) error
+	ListByEntity(ctx context.Context, entityID uuid.UUID, entityType string) ([]*entity.TagAssignment, error)
+	ListByTag(ctx context.Context, tagID uuid.UUID) ([]*entity.TagAssignment, error)
+	GetByID(ctx context.Context, id uuid.UUID) (*entity.TagAssignment, error)
+}
+
+type PostgresTagAssignmentRepository struct {
+	db *pgxpool.Pool
+}
+
+func NewPostgresTagAssignmentRepository(db *pgxpool.Pool) *PostgresTagAssignmentRepository {
+	return &PostgresTagAssignmentRepository{db: db}
+}
+
+func (r *PostgresTagAssignmentRepository) Assign(ctx context.Context, ta *entity.TagAssignment) error {
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO tag_assignments (id, tag_id, entity_id, entity_type, author_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, ta.ID, ta.TagID, ta.EntityID, ta.EntityType, ta.AuthorID, ta.CreatedAt, ta.UpdatedAt)
+	return err
+}
+
+func (r *PostgresTagAssignmentRepository) Unassign(ctx context.Context, id uuid.UUID, entityID uuid.UUID) error {
+	var cmdAssign *entity.TagAssignment
+	var err error
+
+	if id != uuid.Nil {
+		cmdAssign, err = r.GetByID(ctx, id)
+	} else {
+		// Если id не передан (uuid.Nil), можно реализовать удаление по entityID - при необходимости
+		// В данном случае для удаления по id всегда id передается
+		return errors.New("id is required for unassign")
+	}
+	if err != nil {
+		return err
+	}
+	if cmdAssign == nil {
+		return ErrTagAssignmentNotFound
+	}
+
+	_, err = r.db.Exec(ctx, `
+		DELETE FROM tag_assignments WHERE id = $1
+	`, id)
+	return err
+}
+
+func (r *PostgresTagAssignmentRepository) GetByID(ctx context.Context, id uuid.UUID) (*entity.TagAssignment, error) {
+	row := r.db.QueryRow(ctx, `
+		SELECT id, tag_id, entity_id, entity_type, author_id, created_at, updated_at
+		FROM tag_assignments WHERE id = $1
+	`, id)
+
+	ta := &entity.TagAssignment{}
+	err := row.Scan(&ta.ID, &ta.TagID, &ta.EntityID, &ta.EntityType, &ta.AuthorID, &ta.CreatedAt, &ta.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return ta, nil
+}
+
+func (r *PostgresTagAssignmentRepository) ListByEntity(ctx context.Context, entityID uuid.UUID, entityType string) ([]*entity.TagAssignment, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, tag_id, entity_id, entity_type, author_id, created_at, updated_at
+		FROM tag_assignments
+		WHERE entity_id = $1 AND entity_type = $2
+	`, entityID, entityType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	assignments := []*entity.TagAssignment{}
+	for rows.Next() {
+		ta := &entity.TagAssignment{}
+		err := rows.Scan(&ta.ID, &ta.TagID, &ta.EntityID, &ta.EntityType, &ta.AuthorID, &ta.CreatedAt, &ta.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		assignments = append(assignments, ta)
+	}
+	return assignments, nil
+}
+
+func (r *PostgresTagAssignmentRepository) ListByTag(ctx context.Context, tagID uuid.UUID) ([]*entity.TagAssignment, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, tag_id, entity_id, entity_type, author_id, created_at, updated_at
+		FROM tag_assignments
+		WHERE tag_id = $1
+	`, tagID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	assignments := []*entity.TagAssignment{}
+	for rows.Next() {
+		ta := &entity.TagAssignment{}
+		err := rows.Scan(&ta.ID, &ta.TagID, &ta.EntityID, &ta.EntityType, &ta.AuthorID, &ta.CreatedAt, &ta.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		assignments = append(assignments, ta)
+	}
+	return assignments, nil
+}
+
+
+=== internal/tag/repository/tag_repository.go ===
+package repository
+
+import (
+	"context"
+	"errors"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kostinp/edu-platform-backend/internal/shared/pagination"
+	"github.com/kostinp/edu-platform-backend/internal/tag/entity"
+)
+
+var ErrTagNotFound = errors.New("tag not found")
+
+// TagRepository описывает интерфейс работы с тегами
+type TagRepository interface {
+	Create(ctx context.Context, tag *entity.Tag) error
+	Update(ctx context.Context, tag *entity.Tag) error
+	GetByID(ctx context.Context, id uuid.UUID) (*entity.Tag, error)
+	List(ctx context.Context, pag pagination.Params) ([]*entity.Tag, int, error)
+	Delete(ctx context.Context, id uuid.UUID) error
+}
+
+// PostgresTagRepository — реализация TagRepository для PostgreSQL
+type PostgresTagRepository struct {
+	db *pgxpool.Pool
+}
+
+// allowedSortFields: API-поля => БД-поля
+var allowedSortFields = map[string]string{
+	"created_at": "created_at",
+	"name":       "name",
+}
+
+// NewPostgresTagRepository создает новый экземпляр PostgresTagRepository
+func NewPostgresTagRepository(db *pgxpool.Pool) *PostgresTagRepository {
+	return &PostgresTagRepository{db: db}
+}
+
+// Create добавляет новый тег в базу
+func (r *PostgresTagRepository) Create(ctx context.Context, tag *entity.Tag) error {
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO tags (id, name, description, author_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, tag.ID, tag.Name, tag.Description, tag.AuthorID, tag.CreatedAt, tag.UpdatedAt)
+	return err
+}
+
+// Update обновляет существующий тег
+func (r *PostgresTagRepository) Update(ctx context.Context, tag *entity.Tag) error {
+	existingTag, err := r.GetByID(ctx, tag.ID)
+	if err != nil {
+		return err
+	}
+	if existingTag == nil {
+		return ErrTagNotFound
+	}
+
+	_, err = r.db.Exec(ctx, `
+		UPDATE tags
+		SET name = $1, description = $2, updated_at = $3
+		WHERE id = $4
+	`, tag.Name, tag.Description, tag.UpdatedAt, tag.ID)
+	return err
+}
+
+// Delete удаляет тег по ID
+func (r *PostgresTagRepository) Delete(ctx context.Context, tagID uuid.UUID) error {
+	_, err := r.db.Exec(ctx, `
+		DELETE FROM tags WHERE id = $1
+	`, tagID)
+	return err
+}
+
+// GetByID возвращает тег по ID
+func (r *PostgresTagRepository) GetByID(ctx context.Context, id uuid.UUID) (*entity.Tag, error) {
+	row := r.db.QueryRow(ctx, `
+		SELECT id, name, description, author_id, created_at, updated_at
+		FROM tags WHERE id = $1
+	`, id)
+
+	tag := &entity.Tag{}
+	err := row.Scan(&tag.ID, &tag.Name, &tag.Description, &tag.AuthorID, &tag.CreatedAt, &tag.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return tag, nil
+}
+
+// List возвращает список тегов с пагинацией
+func (r *PostgresTagRepository) List(ctx context.Context, limit, offset int) ([]*entity.Tag, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, name, description, author_id, created_at, updated_at
+		FROM tags
+		ORDER BY created_at DESC
+		LIMIT $1 OFFSET $2
+	`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tags []*entity.Tag
+	for rows.Next() {
+		tag := &entity.Tag{}
+		err := rows.Scan(&tag.ID, &tag.Name, &tag.Description, &tag.AuthorID, &tag.CreatedAt, &tag.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	return tags, nil
+}
+
+
+=== internal/tag/transport/http/tag_handler.go ===
+package http
+
+import (
+	"net/http"
+
+	"github.com/google/uuid"
+	myHttp "github.com/kostinp/edu-platform-backend/internal/shared/pagination"
+	"github.com/kostinp/edu-platform-backend/internal/tag/entity"
+	"github.com/kostinp/edu-platform-backend/internal/tag/usecase"
+	"github.com/labstack/echo/v4"
+)
+
+type TagHandler struct {
+	TagUsecase           usecase.TagUsecase
+	TagAssignmentUsecase usecase.TagAssignmentUsecase
+}
+
+func NewTagHandler(tu usecase.TagUsecase, tau usecase.TagAssignmentUsecase) *TagHandler {
+	return &TagHandler{
+		TagUsecase:           tu,
+		TagAssignmentUsecase: tau,
+	}
+}
+
+// CreateTag
+// @Summary Создать тег
+// @Tags Tag
+// @Security BearerAuth
+// @Accept json
+// @Produce json
+// @Param tag body entity.Tag true "Тег"
+// @Success 201 {object} entity.Tag
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tags [post]
+func (h *TagHandler) CreateTag(c echo.Context) error {
+	userIDStr := c.Get("user_id").(string)
+	authorID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	tag := new(entity.Tag)
+	if err := c.Bind(tag); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	err = h.TagUsecase.CreateTag(c.Request().Context(), tag, authorID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create tag"})
+	}
+
+	return c.JSON(http.StatusCreated, tag)
+}
+
+// ListTags
+// @Summary Получить список тегов
+// @Tags Tag
+// @Security BearerAuth
+// @Produce json
+// @Param limit query int false "Количество" default(50)
+// @Param offset query int false "Смещение" default(0)
+// @Success 200 {array} entity.Tag
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tags [get]
+// ListTags
+// @Summary Получить список тегов
+// @Tags Tag
+// @Security BearerAuth
+// @Produce json
+// @Param limit query int false "Количество" default(50)
+// @Param offset query int false "Смещение" default(0)
+// @Param sort_by query string false "Поле сортировки (name, created_at)" default(created_at)
+// @Param order query string false "Порядок сортировки (asc, desc)" default(desc)
+// @Success 200 {object} dto.PaginatedResponse[entity.Tag]
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tags [get]
+func (h *TagHandler) ListTags(c echo.Context) error {
+	pag := myHttp.ParsePaginationParams(c)
+	paginationParams := pag.ToDomainParams()
+
+	tags, total, err := h.TagUsecase.ListTags(c.Request().Context(), paginationParams)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error": "failed to list tags",
+		})
+	}
+
+	return c.JSON(http.StatusOK, dto.PaginatedResponse[*entity.Tag]{
+		Items:  tags,
+		Total:  total,
+		Limit:  paginationParams.Limit,
+		Offset: paginationParams.Offset,
+	})
+}
+
+// GetTagByID
+// @Summary Получить тег по ID
+// @Tags Tag
+// @Security BearerAuth
+// @Produce json
+// @Param id path string true "ID тега"
+// @Success 200 {object} entity.Tag
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 404 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tags/{id} [get]
+func (h *TagHandler) GetTagByID(c echo.Context) error {
+	idStr := c.Param("id")
+	tagID, err := uuid.Parse(idStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tag id"})
+	}
+
+	tag, err := h.TagUsecase.GetTagByID(c.Request().Context(), tagID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get tag"})
+	}
+	if tag == nil {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "tag not found"})
+	}
+
+	return c.JSON(http.StatusOK, tag)
+}
+
+// DeleteTag
+// @Summary Удалить тег по ID
+// @Tags Tag
+// @Security BearerAuth
+// @Param id path string true "ID тега"
+// @Success 204 {string} string "No Content"
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tags/{id} [delete]
+func (h *TagHandler) DeleteTag(c echo.Context) error {
+	idStr := c.Param("id")
+	tagID, err := uuid.Parse(idStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tag id"})
+	}
+
+	err = h.TagUsecase.DeleteTag(c.Request().Context(), tagID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete tag"})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+// AssignTag
+// @Summary Назначить тег сущности
+// @Tags TagAssignment
+// @Security BearerAuth
+// @Accept json
+// @Produce json
+// @Param assignment body entity.TagAssignment true "Назначение тега"
+// @Success 201 {object} entity.TagAssignment
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tag-assignments [post]
+func (h *TagHandler) AssignTag(c echo.Context) error {
+	userIDStr := c.Get("user_id").(string)
+	authorID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	ta := new(entity.TagAssignment)
+	if err := c.Bind(ta); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	err = h.TagAssignmentUsecase.AssignTag(c.Request().Context(), ta, authorID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to assign tag"})
+	}
+
+	return c.JSON(http.StatusCreated, ta)
+}
+
+// RemoveAssignment
+// @Summary Удалить назначение тега по ID
+// @Tags TagAssignment
+// @Security BearerAuth
+// @Param id path string true "ID назначения тега"
+// @Success 204 {string} string "No Content"
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tag-assignments/{id} [delete]
+func (h *TagHandler) RemoveAssignment(c echo.Context) error {
+	idStr := c.Param("id")
+	assignmentID, err := uuid.Parse(idStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid assignment id"})
+	}
+
+	err = h.TagAssignmentUsecase.RemoveAssignment(c.Request().Context(), assignmentID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to remove assignment"})
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+
+// ListAssignmentsByEntity
+// @Summary Получить назначения тегов для сущности
+// @Tags TagAssignment
+// @Security BearerAuth
+// @Produce json
+// @Param entity_id query string true "ID сущности"
+// @Param entity_type query string true "Тип сущности"
+// @Success 200 {array} entity.TagAssignment
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tag-assignments/by-entity [get]
+func (h *TagHandler) ListAssignmentsByEntity(c echo.Context) error {
+	entityIDStr := c.QueryParam("entity_id")
+	entityType := c.QueryParam("entity_type")
+
+	entityID, err := uuid.Parse(entityIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid entity id"})
+	}
+	if entityType == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "entity_type required"})
+	}
+
+	assignments, err := h.TagAssignmentUsecase.ListAssignmentsByEntity(c.Request().Context(), entityID, entityType)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list assignments"})
+	}
+
+	return c.JSON(http.StatusOK, assignments)
+}
+
+// ListAssignmentsByTag
+// @Summary Получить назначения по тегу
+// @Tags TagAssignment
+// @Security BearerAuth
+// @Produce json
+// @Param tag_id query string true "ID тега"
+// @Success 200 {array} entity.TagAssignment
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /api/tag-assignments/by-tag [get]
+func (h *TagHandler) ListAssignmentsByTag(c echo.Context) error {
+	tagIDStr := c.QueryParam("tag_id")
+
+	tagID, err := uuid.Parse(tagIDStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tag id"})
+	}
+
+	assignments, err := h.TagAssignmentUsecase.ListAssignmentsByTag(c.Request().Context(), tagID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list assignments"})
+	}
+
+	return c.JSON(http.StatusOK, assignments)
+}
+
+
+=== internal/tag/entity/tag_assignment.go ===
+package entity
+
+import (
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/shared/entity"
+)
+
+type TagAssignment struct {
+	entity.Base
+
+	TagID      uuid.UUID `json:"tag_id" db:"tag_id"`
+	EntityType string    `json:"entity_type" db:"entity_type"`
+	EntityID   uuid.UUID `json:"entity_id" db:"entity_id"`
+}
+
+
+=== internal/tag/entity/tag.go ===
+package entity
+
+import "github.com/kostinp/edu-platform-backend/internal/shared/entity"
+
+type Tag struct {
+	entity.Base
+
+	Name        string `json:"name" db:"name"`
+	Description string `json:"description" db:"description"`
+}
+
+
+=== internal/tag/usecase/tag_usecase.go ===
+package usecase
+
+import (
+	"context"
+	"errors"
+
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/shared/pagination"
+	"github.com/kostinp/edu-platform-backend/internal/tag/entity"
+	"github.com/kostinp/edu-platform-backend/internal/tag/repository"
+)
+
+var ErrTagNotFound = errors.New("tag not found")
+
+type TagUsecase interface {
+	CreateTag(ctx context.Context, tag *entity.Tag, authorID uuid.UUID) error
+	UpdateTag(ctx context.Context, tag *entity.Tag) error
+	DeleteTag(ctx context.Context, tagID uuid.UUID) error
+	GetTagByID(ctx context.Context, tagID uuid.UUID) (*entity.Tag, error)
+	ListTags(ctx context.Context, pag pagination.Params) ([]*entity.Tag, int, error)
+}
+
+type tagUsecase struct {
+	tagRepo repository.TagRepository
+}
+
+func NewTagUsecase(tr repository.TagRepository) TagUsecase {
+	return &tagUsecase{tagRepo: tr}
+}
+
+func (u *tagUsecase) CreateTag(ctx context.Context, tag *entity.Tag, authorID uuid.UUID) error {
+	tag.Init(authorID)
+	return u.tagRepo.Create(ctx, tag)
+}
+
+func (u *tagUsecase) UpdateTag(ctx context.Context, tag *entity.Tag) error {
+	tag.Touch()
+	return u.tagRepo.Update(ctx, tag)
+}
+
+func (u *tagUsecase) DeleteTag(ctx context.Context, tagID uuid.UUID) error {
+	return u.tagRepo.Delete(ctx, tagID)
+}
+
+func (u *tagUsecase) GetTagByID(ctx context.Context, tagID uuid.UUID) (*entity.Tag, error) {
+	return u.tagRepo.GetByID(ctx, tagID)
+}
+
+func (u *tagUsecase) ListTags(ctx context.Context, pag pagination.Params) ([]*entity.Tag, int, error) {
+	return u.tagRepo.List(ctx, pag)
+}
+
+
+=== internal/tag/usecase/tag_assignment_usecase.go ===
+package usecase
+
+import (
+	"context"
+
+	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/tag/entity"
+	"github.com/kostinp/edu-platform-backend/internal/tag/repository"
+)
+
+type TagAssignmentUsecase interface {
+	AssignTag(ctx context.Context, ta *entity.TagAssignment, authorID uuid.UUID) error
+	RemoveAssignment(ctx context.Context, id uuid.UUID) error
+	ListAssignmentsByEntity(ctx context.Context, entityID uuid.UUID, entityType string) ([]*entity.TagAssignment, error)
+	ListAssignmentsByTag(ctx context.Context, tagID uuid.UUID) ([]*entity.TagAssignment, error)
+}
+
+type tagAssignmentUsecase struct {
+	assignmentRepo repository.TagAssignmentRepository
+}
+
+func NewTagAssignmentUsecase(ar repository.TagAssignmentRepository) TagAssignmentUsecase {
+	return &tagAssignmentUsecase{assignmentRepo: ar}
+}
+
+func (u *tagAssignmentUsecase) AssignTag(ctx context.Context, ta *entity.TagAssignment, authorID uuid.UUID) error {
+	ta.Init(authorID)
+	return u.assignmentRepo.Assign(ctx, ta) // Вызов Assign, не Create
+}
+
+func (u *tagAssignmentUsecase) RemoveAssignment(ctx context.Context, id uuid.UUID) error {
+	return u.assignmentRepo.Unassign(ctx, id, uuid.Nil) // Для удаления по id, передаем entityID = uuid.Nil (будет игнорироваться)
+}
+
+func (u *tagAssignmentUsecase) ListAssignmentsByEntity(ctx context.Context, entityID uuid.UUID, entityType string) ([]*entity.TagAssignment, error) {
+	return u.assignmentRepo.ListByEntity(ctx, entityID, entityType)
+}
+
+func (u *tagAssignmentUsecase) ListAssignmentsByTag(ctx context.Context, tagID uuid.UUID) ([]*entity.TagAssignment, error) {
+	return u.assignmentRepo.ListByTag(ctx, tagID)
+}

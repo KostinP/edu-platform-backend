@@ -1,13 +1,13 @@
 package main
 
 import (
-	"github.com/kostinp/edu-platform-backend/pkg/config"
-	"github.com/kostinp/edu-platform-backend/pkg/middleware"
-
+	"github.com/kostinp/edu-platform-backend/internal/shared/config"
+	"github.com/kostinp/edu-platform-backend/internal/shared/middleware"
 	transport "github.com/kostinp/edu-platform-backend/internal/user/transport/http"
 	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
 
-	echo "github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	echoSwagger "github.com/swaggo/echo-swagger"
 )
 
@@ -30,6 +30,9 @@ func newEchoServer(
 	e.GET("/health", func(c echo.Context) error {
 		return c.JSON(200, map[string]string{"status": "ok"})
 	})
+
+	// Prometheus метрики
+	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
 	// Ваш JWT middleware
 	jwtMiddleware := middleware.JWTMiddleware([]byte(cfg.JWT.Secret), sessionUsecase)

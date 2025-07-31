@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS tag_assignments; 
+DROP TABLE IF EXISTS tags; 

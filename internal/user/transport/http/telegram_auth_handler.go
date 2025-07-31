@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/kostinp/edu-platform-backend/internal/shared/config"
+	"github.com/kostinp/edu-platform-backend/internal/shared/geo"
+	"github.com/kostinp/edu-platform-backend/internal/shared/telegram"
 	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
-	"github.com/kostinp/edu-platform-backend/pkg/config"
-	"github.com/kostinp/edu-platform-backend/pkg/geo"
-	"github.com/kostinp/edu-platform-backend/pkg/telegram"
 	"github.com/labstack/echo/v4"
 )
 

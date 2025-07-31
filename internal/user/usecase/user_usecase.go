@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/shared/telegram"
 	"github.com/kostinp/edu-platform-backend/internal/user/entity"
-	"github.com/kostinp/edu-platform-backend/pkg/telegram"
 )
 
 // UserRepository описывает методы репозитория, которые нужны сервису
@@ -16,7 +16,7 @@ type UserRepository interface {
 	Create(ctx context.Context, user *entity.User) error
 	Update(ctx context.Context, user *entity.User) error
 	GetByTelegramID(ctx context.Context, telegramID int64) (*entity.User, error)
-	GetByID(ctx context.Context, id uuid.UUID) (*entity.User, error) // лучше UUID, чтобы совпадало с типом
+	GetByID(ctx context.Context, id uuid.UUID) (*entity.User, error)
 }
 
 // UserService реализует бизнес-логику для пользователей
@@ -118,4 +118,8 @@ func (s *UserService) CreateUserSession(
 
 	token := uuid.New().String() // можно использовать как внутренний ID
 	return s.sessionUC.CreateSession(ctx, userID, token, userAgent, ip, country, city, expiresIn)
+}
+
+func (s *UserService) GetUserByID(ctx context.Context, id uuid.UUID) (*entity.User, error) {
+	return s.repo.GetByID(ctx, id)
 }

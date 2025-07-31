@@ -7,9 +7,9 @@ import (
 	"time"
 
 	_ "github.com/kostinp/edu-platform-backend/docs"
+	"github.com/kostinp/edu-platform-backend/internal/shared/config"
+	"github.com/kostinp/edu-platform-backend/internal/shared/logger"
 	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
-	"github.com/kostinp/edu-platform-backend/pkg/config"
-	"github.com/kostinp/edu-platform-backend/pkg/logger"
 )
 
 // @title Edu Platform API

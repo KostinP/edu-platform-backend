@@ -9,6 +9,9 @@ MIGRATIONS_DIR := ./migrations
 swagger:
 	swag init --dir $(SWAGGER_DIRS) --output ./docs
 
+wire:
+	~/go/bin/wire ./cmd
+
 run:
 	@echo "🚀 Запуск сервера разработки..."
 	air

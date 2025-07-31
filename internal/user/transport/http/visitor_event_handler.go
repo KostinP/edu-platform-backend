@@ -4,8 +4,8 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
+	"github.com/kostinp/edu-platform-backend/internal/shared/middleware"
 	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
-	"github.com/kostinp/edu-platform-backend/pkg/middleware"
 	"github.com/labstack/echo/v4"
 )
 

@@ -7,16 +7,22 @@
 package main
 
 import (
+	"github.com/kostinp/edu-platform-backend/internal/shared/config"
+	"github.com/kostinp/edu-platform-backend/internal/shared/db"
+	"github.com/kostinp/edu-platform-backend/internal/user"
 	"github.com/kostinp/edu-platform-backend/internal/user/repository"
 	"github.com/kostinp/edu-platform-backend/internal/user/transport/http"
 	"github.com/kostinp/edu-platform-backend/internal/user/usecase"
-	"github.com/kostinp/edu-platform-backend/pkg/config"
-	"github.com/kostinp/edu-platform-backend/pkg/db"
 	"github.com/labstack/echo/v4"
+)
+
+import (
+	_ "github.com/kostinp/edu-platform-backend/docs"
 )
 
 // Injectors from wire.go:
 
+// Главный wire-компонент
 func InitializeServer(cfg *config.Config) (*echo.Echo, error) {
 	pool := db.ConnectPostgres(cfg)
 	postgresUserRepository := repository.NewPostgresUserRepository(pool)
@@ -27,8 +33,8 @@ func InitializeServer(cfg *config.Config) (*echo.Echo, error) {
 	postgresVisitorEventRepo := repository.NewPostgresVisitorEventRepo(pool)
 	visitorEventUsecase := usecase.NewVisitorEventUsecase(postgresVisitorEventRepo)
 	visitorEventHandler := transport.NewVisitorEventHandler(visitorEventUsecase)
-	botToken := provideBotToken(cfg)
-	jwtSecret := provideJwtSecret(cfg)
+	botToken := user.ProvideBotToken(cfg)
+	jwtSecret := user.ProvideJwtSecret(cfg)
 	telegramAuthHandler := transport.NewTelegramAuthHandler(userService, botToken, jwtSecret)
 	sessionHandler := transport.NewSessionHandler(sessionUsecaseImpl)
 	echoEcho, err := newEchoServer(cfg, userHandler, visitorEventHandler, telegramAuthHandler, sessionHandler, sessionUsecaseImpl, userService)
@@ -38,20 +44,10 @@ func InitializeServer(cfg *config.Config) (*echo.Echo, error) {
 	return echoEcho, nil
 }
 
+// Для middleware и background job'ов
 func InitializeSessionUsecase(cfg *config.Config) (usecase.SessionUsecase, error) {
 	pool := db.ConnectPostgres(cfg)
 	postgresSessionRepository := repository.NewPostgresSessionRepository(pool)
 	sessionUsecaseImpl := usecase.NewSessionUsecase(postgresSessionRepository)
 	return sessionUsecaseImpl, nil
-}
-
-// wire.go:
-
-// Обёртки для строковых типов
-func provideBotToken(cfg *config.Config) config.BotToken {
-	return config.BotToken(cfg.Telegram.Token)
-}
-
-func provideJwtSecret(cfg *config.Config) config.JwtSecret {
-	return config.JwtSecret(cfg.JWT.Secret)
 }
